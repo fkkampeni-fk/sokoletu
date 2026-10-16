@@ -87,14 +87,13 @@ class UserLogin(BaseModel):
     password: str
 
 class ProductCreate(BaseModel):
-    seller_id: int
     title: str
     category: str
     price: float
-    condition: str
     location: str
     phone: str
-
+    seller_id: Optional[int] = 1
+    condition: Optional[str] = "Mpya"
 class CommunityPostCreate(BaseModel):
     author_id: int
     author_name: str
