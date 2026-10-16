@@ -2,6 +2,7 @@ import sqlite3
 import hashlib
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 app = FastAPI(
@@ -10,9 +11,17 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# --- CORS CONFIGURATION (ONGEZA HAPA) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Inaruhusu maombi kutoka sehemu yoyote (ikiwemo localhost:8080)
+    allow_credentials=True,
+    allow_methods=["*"],  # Inaruhusu GET, POST, PUT, DELETE n.k.
+    allow_headers=["*"],  # Inaruhusu headers zote
+)
+
 # --- DATABASE INITIALIZATION ---
 DB_NAME = "local_market.db"
-
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
