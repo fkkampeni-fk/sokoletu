@@ -43,6 +43,11 @@ def db():
         conn.close()
 
 def init_db():
+    """Create tables and safely add columns missing from older databases.
+
+    Existing rows and tables are preserved; indexes are created only after
+    the required columns have been checked/added.
+    """
     with db() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
@@ -65,17 +70,52 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS community_posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT, author_id INTEGER, author_name TEXT,
             title TEXT NOT NULL, content TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        # Safe additive migrations for existing SQLite databases.
-        for table, col, decl in [
-            ("products", "is_sold", "INTEGER DEFAULT 0"),
-            ("products", "item_type", "TEXT DEFAULT 'product'"),
-            ("buyer_requests", "item_type", "TEXT DEFAULT 'product'"),
-        ]:
-            existing = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
-            if col not in existing:
-                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_products_region_type ON products(region, item_type)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_buyer_requests_status ON buyer_requests(status)")
+
+        # Add columns expected by this version when upgrading an older DB.
+        # Declarations intentionally avoid NOT NULL without a default so SQLite
+        # can migrate tables that already contain rows.
+        required_columns = {
+            "users": {
+                "username": "TEXT", "password": "TEXT", "phone": "TEXT", "location": "TEXT",
+            },
+            "products": {
+                "seller_id": "INTEGER", "title": "TEXT", "description": "TEXT",
+                "category": "TEXT", "item_type": "TEXT DEFAULT 'product'", "price": "REAL",
+                "condition": "TEXT", "location": "TEXT", "region": "TEXT", "district": "TEXT",
+                "ward": "TEXT", "street": "TEXT", "phone": "TEXT", "image_url": "TEXT",
+                "is_sold": "INTEGER DEFAULT 0", "created_at": "TIMESTAMP",
+            },
+            "buyer_requests": {
+                "buyer_id": "INTEGER", "buyer_name": "TEXT", "title": "TEXT",
+                "description": "TEXT", "category": "TEXT", "item_type": "TEXT DEFAULT 'product'",
+                "budget": "REAL", "location": "TEXT", "region": "TEXT", "district": "TEXT",
+                "ward": "TEXT", "street": "TEXT", "phone": "TEXT",
+                "status": "TEXT DEFAULT 'active'", "created_at": "TIMESTAMP",
+            },
+            "orders": {
+                "item_id": "INTEGER", "item_type": "TEXT", "buyer_id": "INTEGER",
+                "seller_id": "INTEGER", "quantity": "INTEGER DEFAULT 1",
+                "status": "TEXT DEFAULT 'pending'", "created_at": "TIMESTAMP",
+            },
+            "community_posts": {
+                "author_id": "INTEGER", "author_name": "TEXT", "title": "TEXT",
+                "content": "TEXT", "created_at": "TIMESTAMP",
+            },
+        }
+        for table, columns in required_columns.items():
+            existing = {row["name"] for row in c.execute(f"PRAGMA table_info({table})")}
+            for column, declaration in columns.items():
+                if column not in existing:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+        # Index creation must happen after legacy-schema migrations.
+        product_columns = {row["name"] for row in c.execute("PRAGMA table_info(products)")}
+        if {"region", "item_type"}.issubset(product_columns):
+            c.execute("CREATE INDEX IF NOT EXISTS idx_products_region_type ON products(region, item_type)")
+        request_columns = {row["name"] for row in c.execute("PRAGMA table_info(buyer_requests)")}
+        if "status" in request_columns:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_buyer_requests_status ON buyer_requests(status)")
+
 init_db()
 
 def clean_text(value: Optional[str], max_len: int = 500) -> Optional[str]:
