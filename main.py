@@ -149,6 +149,7 @@ class ProductCreate(BaseModel):
     phone: str
     seller_id: Optional[int] = 1
     condition: Optional[str] = "Mpya"
+    image_url: Optional[str] = "https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=300" # Picha ya mfano
 class CommunityPostCreate(BaseModel):
     author_id: int
     author_name: str
