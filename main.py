@@ -76,16 +76,71 @@ def hash_password(password: str) -> str:
 
 
 # --- PYDANTIC SCHEMAS (Data Validation) ---
+# --- PYDANTIC MODELS ---
 class UserRegister(BaseModel):
     username: str
     password: str
-    phone: str
-    location: str
+    phone: Optional[str] = None
+    location: Optional[str] = None
 
 class UserLogin(BaseModel):
     username: str
     password: str
 
+# --- REGISTER ENDPOINT ---
+@app.post("/api/users/register", status_code=status.HTTP_201_CREATED)
+def register_user(user: UserRegister):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # Hash password kwa usalama
+    hashed_password = hashlib.sha256(user.password.encode()).hexdigest()
+    
+    try:
+        cursor.execute(
+            "INSERT INTO users (username, password, phone, location) VALUES (?, ?, ?, ?)",
+            (user.username, hashed_password, user.phone, user.location)
+        )
+        conn.commit()
+        user_id = cursor.lastrowid
+        conn.close()
+        return {"message": "Mtumiaji amesajiliwa kikamilifu", "user_id": user_id}
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="Jina hili la mtumiaji tayari limeshatumika."
+        )
+
+# --- LOGIN ENDPOINT ---
+@app.post("/api/users/login")
+def login_user(user: UserLogin):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    hashed_password = hashlib.sha256(user.password.encode()).hexdigest()
+    cursor.execute(
+        "SELECT id, username, phone, location FROM users WHERE username = ? AND password = ?",
+        (user.username, hashed_password)
+    )
+    db_user = cursor.fetchone()
+    conn.close()
+    
+    if db_user:
+        return {
+            "message": "Umeingia kikamilifu",
+            "user": {
+                "id": db_user[0],
+                "username": db_user[1],
+                "phone": db_user[2],
+                "location": db_user[3]
+            }
+        }
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Jina au nenosiri si sahihi."
+        )
 class ProductCreate(BaseModel):
     title: str
     category: str
