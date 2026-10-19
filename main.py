@@ -1,43 +1,41 @@
 import sqlite3
 import hashlib
-from typing import List, Optional
+from typing import Optional, List
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(
-    title="Soko la Mtaa API",
-    description="Backend API kwa ajili ya Mobile App ya Soko la Mtaa na Community Forum",
-    version="1.0.0"
-)
+DB_NAME = "local_market.db"
 
-# --- CORS CONFIGURATION (ONGEZA HAPA) ---
+app = FastAPI(title="Soko la Mtaa API", version="2.0.0")
+
+# Ruhusu CORS kwa ajili ya Frontend (Netlify/Localhost)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Inaruhusu maombi kutoka sehemu yoyote (ikiwemo localhost:8080)
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Inaruhusu GET, POST, PUT, DELETE n.k.
-    allow_headers=["*"],  # Inaruhusu headers zote
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # --- DATABASE INITIALIZATION ---
-DB_NAME = "local_market.db"
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # Meza ya Watumiaji (Ipo tayari)
+    # 1. Users Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
             phone TEXT,
-            location TEXT
+            location TEXT,
+            user_type TEXT DEFAULT 'both'
         )
     """)
 
-    # Meza ya Bidhaa (Hakikisha description na image_url zipo)
+    # 2. Products & Services Table (Muuzaji / Mtoa Huduma)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,33 +43,72 @@ def init_db():
             title TEXT NOT NULL,
             description TEXT,
             category TEXT,
+            item_type TEXT DEFAULT 'product', -- 'product' au 'service'
             price REAL NOT NULL,
             condition TEXT,
             location TEXT,
+            region TEXT,
+            district TEXT,
             phone TEXT,
-            image_url TEXT
+            image_url TEXT,
+            is_sold INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    # Meza ya Majadiliano (Ipo tayari)
+    # 3. Buyer Requests Table (Mnunuzi anachotafuta / Bajeti yake)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS buyer_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            buyer_id INTEGER,
+            buyer_name TEXT,
+            title TEXT NOT NULL,
+            description TEXT,
+            category TEXT,
+            item_type TEXT DEFAULT 'product', -- 'product' au 'service'
+            budget REAL NOT NULL,
+            location TEXT,
+            region TEXT,
+            district TEXT,
+            phone TEXT,
+            status TEXT DEFAULT 'active',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 4. Orders / Inquiries Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER,
+            item_type TEXT, -- 'product' au 'buyer_request'
+            buyer_id INTEGER,
+            seller_id INTEGER,
+            quantity INTEGER DEFAULT 1,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 5. Community Forum Posts Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS community_posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             author_id INTEGER,
             author_name TEXT,
             title TEXT NOT NULL,
-            content TEXT NOT NULL
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
     conn.commit()
     conn.close()
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
 
+init_db()
 
-# --- PYDANTIC SCHEMAS (Data Validation) ---
-# --- PYDANTIC MODELS ---
+# --- PYDANTIC SCHEMAS ---
+
 class UserRegister(BaseModel):
     username: str
     password: str
@@ -82,15 +119,58 @@ class UserLogin(BaseModel):
     username: str
     password: str
 
-# --- REGISTER ENDPOINT ---
+class ProductCreate(BaseModel):
+    title: str
+    description: Optional[str] = None
+    category: str
+    item_type: Optional[str] = "product"  # 'product' au 'service'
+    price: float
+    condition: Optional[str] = "Mpya"
+    location: str
+    region: Optional[str] = "Dar es Salaam"
+    district: Optional[str] = "Ubungo"
+    phone: str
+    seller_id: Optional[int] = 1
+    image_url: Optional[str] = None
+
+class BuyerRequestCreate(BaseModel):
+    title: str
+    description: Optional[str] = None
+    category: str
+    item_type: Optional[str] = "product"  # 'product' au 'service'
+    budget: float
+    location: str
+    region: Optional[str] = "Dar es Salaam"
+    district: Optional[str] = "Ubungo"
+    phone: str
+    buyer_id: Optional[int] = 1
+    buyer_name: Optional[str] = "Mnunuzi"
+
+class OrderCreate(BaseModel):
+    item_id: int
+    item_type: str  # 'product' au 'buyer_request'
+    buyer_id: int
+    seller_id: int
+    quantity: Optional[int] = 1
+
+class CommunityPostCreate(BaseModel):
+    author_id: int
+    author_name: str
+    title: str
+    content: str
+
+# --- ROUTES & ENDPOINTS ---
+
+@app.get("/")
+def home():
+    return {"message": "Soko la Mtaa API v2.0 - Bidhaa, Huduma na Matangazo ya Wanunuzi ipo tayari!"}
+
+# --- USERS ---
 @app.post("/api/users/register", status_code=status.HTTP_201_CREATED)
 def register_user(user: UserRegister):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    
-    # Hash password kwa usalama
     hashed_password = hashlib.sha256(user.password.encode()).hexdigest()
-    
     try:
         cursor.execute(
             "INSERT INTO users (username, password, phone, location) VALUES (?, ?, ?, ?)",
@@ -99,20 +179,15 @@ def register_user(user: UserRegister):
         conn.commit()
         user_id = cursor.lastrowid
         conn.close()
-        return {"message": "Mtumiaji amesajiliwa kikamilifu", "user_id": user_id}
+        return {"message": "Mtumiaji amesajiliwa kikamilifu", "user": {"id": user_id, "username": user.username, "phone": user.phone, "location": user.location}}
     except sqlite3.IntegrityError:
         conn.close()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail="Jina hili la mtumiaji tayari limeshatumika."
-        )
+        raise HTTPException(status_code=400, detail="Jina hili la mtumiaji tayari limeshatumika.")
 
-# --- LOGIN ENDPOINT ---
 @app.post("/api/users/login")
 def login_user(user: UserLogin):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    
     hashed_password = hashlib.sha256(user.password.encode()).hexdigest()
     cursor.execute(
         "SELECT id, username, phone, location FROM users WHERE username = ? AND password = ?",
@@ -120,170 +195,68 @@ def login_user(user: UserLogin):
     )
     db_user = cursor.fetchone()
     conn.close()
-    
     if db_user:
         return {
             "message": "Umeingia kikamilifu",
-            "user": {
-                "id": db_user[0],
-                "username": db_user[1],
-                "phone": db_user[2],
-                "location": db_user[3]
-            }
+            "user": {"id": db_user[0], "username": db_user[1], "phone": db_user[2], "location": db_user[3]}
         }
     else:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Jina au nenosiri si sahihi."
-        )
-class ProductCreate(BaseModel):
-    title: str
-    description: Optional[str] = None
-    category: str
-    price: float
-    condition: str
-    location: str
-    phone: str
-    seller_id: Optional[int] = 1
-    image_url: Optional[str] = None
-class CommunityPostCreate(BaseModel):
-    author_id: int
-    author_name: str
-    title: str
-    content: str
+        raise HTTPException(status_code=401, detail="Jina au nenosiri si sahihi.")
 
-
-# --- API ENDPOINTS ---
-
-@app.get("/")
-def home():
-    return {"message": "Karibu kwenye Soko la Mtaa API! Mfumo uko LIVE."}
-
-# 1. USER AUTHENTICATION
-@app.post("/api/register", status_code=210)
-def register(user: UserRegister):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT id FROM users WHERE username = ?", (user.username.lower(),))
-    if cursor.fetchone():
-        conn.close()
-        raise HTTPException(status_code=400, detail="Username hii tayari ipo!")
-
-    hashed_pw = hash_password(user.password)
-    cursor.execute(
-        "INSERT INTO users (username, password, phone, location) VALUES (?, ?, ?, ?)",
-        (user.username.lower(), hashed_pw, user.phone, user.location)
-    )
-    conn.commit()
-    conn.close()
-    return {"message": "Akaunti imetengenezwa kikamilifu!"}
-
-@app.post("/api/login")
-def login(user: UserLogin):
-    hashed_pw = hash_password(user.password)
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, username, phone, location FROM users WHERE username = ? AND password = ?",
-        (user.username.lower(), hashed_pw)
-    )
-    db_user = cursor.fetchone()
-    conn.close()
-
-    if not db_user:
-        raise HTTPException(status_code=401, detail="Username au Password siyo sahihi!")
-
-    return {
-        "id": db_user[0],
-        "username": db_user[1],
-        "phone": db_user[2],
-        "location": db_user[3]
-    }
-
-# 2. PRODUCTS ENDPOINTS
-@app.get("/api/products")
-def get_products(category: Optional[str] = None):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    if category:
-        cursor.execute(
-            "SELECT id, title, category, price, condition, location, phone FROM products WHERE status = 'Available' AND category = ?",
-            (category,)
-        )
-    else:
-        cursor.execute(
-            "SELECT id, title, category, price, condition, location, phone FROM products WHERE status = 'Available'"
-        )
-        
-    rows = cursor.fetchall()
-    conn.close()
-
-    products = []
-    for row in rows:
-        products.append({
-            "id": row[0],
-            "title": row[1],
-            "category": row[2],
-            "price": row[3],
-            "condition": row[4],
-            "location": row[5],
-            "phone": row[6]
-        })
-    return products
-
-# --- ADD PRODUCT ---
+# --- PRODUCTS & SERVICES (MUUZAJI / MTOA HUDUMA) ---
 @app.post("/api/products")
 def create_product(product: ProductCreate):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO products (seller_id, title, description, category, price, condition, location, phone, image_url)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO products (seller_id, title, description, category, item_type, price, condition, location, region, district, phone, image_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        product.seller_id,
-        product.title,
-        product.description,
-        product.category,
-        product.price,
-        product.condition,
-        product.location,
-        product.phone,
-        product.image_url
+        product.seller_id, product.title, product.description, product.category,
+        product.item_type, product.price, product.condition, product.location,
+        product.region, product.district, product.phone, product.image_url
     ))
     conn.commit()
     product_id = cursor.lastrowid
     conn.close()
-    return {"message": "Bidhaa imeongezwa kikamilifu", "id": product_id}
+    return {"message": "Imewekwa kikamilifu", "id": product_id}
 
-# --- GET PRODUCTS ---
 @app.get("/api/products")
-def get_products():
+def get_products(item_type: Optional[str] = None, region: Optional[str] = None):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, seller_id, title, description, category, price, condition, location, phone, image_url FROM products ORDER BY id DESC")
+    
+    query = "SELECT id, seller_id, title, description, category, item_type, price, condition, location, region, district, phone, image_url, is_sold FROM products WHERE 1=1"
+    params = []
+    
+    if item_type:
+        query += " AND item_type = ?"
+        params.append(item_type)
+    if region:
+        query += " AND region = ?"
+        params.append(region)
+        
+    query += " ORDER BY id DESC"
+    cursor.execute(query, params)
     rows = cursor.fetchall()
     conn.close()
-    
-    products = []
-    for row in rows:
-        products.append({
-            "id": row[0],
-            "seller_id": row[1],
-            "title": row[2],
-            "description": row[3],
-            "category": row[4],
-            "price": row[5],
-            "condition": row[6],
-            "location": row[7],
-            "phone": row[8],
-            "image_url": row[9]
-        })
-    return products
-# 3. COMMUNITY FORUM ENDPOINTS (Sehemu ya Wafanyabiashara)
-@app.get("/api/community")
-# --- FUTA BIDHAA (DELETE PRODUCT) ---
+
+    return [{
+        "id": r[0], "seller_id": r[1], "title": r[2], "description": r[3],
+        "category": r[4], "item_type": r[5], "price": r[6], "condition": r[7],
+        "location": r[8], "region": r[9], "district": r[10], "phone": r[11],
+        "image_url": r[12], "is_sold": bool(r[13])
+    } for r in rows]
+
+@app.put("/api/products/{product_id}/sold")
+def mark_product_as_sold(product_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE products SET is_sold = 1 WHERE id = ?", (product_id,))
+    conn.commit()
+    conn.close()
+    return {"message": "Bidhaa imewekwa alama ya kuuzwa"}
+
 @app.delete("/api/products/{product_id}")
 def delete_product(product_id: int):
     conn = sqlite3.connect(DB_NAME)
@@ -291,43 +264,75 @@ def delete_product(product_id: int):
     cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
     conn.commit()
     conn.close()
-    return {"message": "Bidhaa imefutwa kikamilifu"}
+    return {"message": "Imefutwa kikamilifu"}
 
-# --- MARK AS SOLD (UPDATE STATUS) ---
-@app.put("/api/products/{product_id}/sold")
-def mark_product_as_sold(product_id: int):
+# --- BUYER REQUESTS (MATANGAZO YA WANUNUZI) ---
+@app.post("/api/buyer-requests")
+def create_buyer_request(req: BuyerRequestCreate):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("UPDATE products SET title = '[IMEHAUZWA] ' || title WHERE id = ?", (product_id,))
+    cursor.execute("""
+        INSERT INTO buyer_requests (buyer_id, buyer_name, title, description, category, item_type, budget, location, region, district, phone)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        req.buyer_id, req.buyer_name, req.title, req.description, req.category,
+        req.item_type, req.budget, req.location, req.region, req.district, req.phone
+    ))
     conn.commit()
+    req_id = cursor.lastrowid
     conn.close()
-    return {"message": "Bidhaa imewekwa alama ya kuuzwa"}
-def get_community_posts():
+    return {"message": "Tangazo la mnunuzi limewekwa kikamilifu", "id": req_id}
+
+@app.get("/api/buyer-requests")
+def get_buyer_requests(region: Optional[str] = None):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, author_name, title, content, created_at FROM community_posts ORDER BY id DESC")
+    query = "SELECT id, buyer_id, buyer_name, title, description, category, item_type, budget, location, region, district, phone, status FROM buyer_requests WHERE status = 'active'"
+    params = []
+    if region:
+        query += " AND region = ?"
+        params.append(region)
+    query += " ORDER BY id DESC"
+    cursor.execute(query, params)
     rows = cursor.fetchall()
     conn.close()
 
-    posts = []
-    for row in rows:
-        posts.append({
-            "id": row[0],
-            "author": row[1],
-            "title": row[2],
-            "content": row[3],
-            "created_at": row[4]
-        })
-    return posts
+    return [{
+        "id": r[0], "buyer_id": r[1], "buyer_name": r[2], "title": r[3],
+        "description": r[4], "category": r[5], "item_type": r[6], "budget": r[7],
+        "location": r[8], "region": r[9], "district": r[10], "phone": r[11], "status": r[12]
+    } for r in rows]
+
+# --- ORDERS & CONTACT REVEAL ---
+@app.post("/api/orders")
+def place_order(order: OrderCreate):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO orders (item_id, item_type, buyer_id, seller_id, quantity)
+        VALUES (?, ?, ?, ?, ?)
+    """, (order.item_id, order.item_type, order.buyer_id, order.seller_id, order.quantity))
+    conn.commit()
+    order_id = cursor.lastrowid
+    conn.close()
+    return {"message": "Ombi / Order imewekwa kikamilifu", "order_id": order_id}
+
+# --- COMMUNITY FORUM ---
+@app.get("/api/community")
+def get_community_posts():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, author_id, author_name, title, content FROM community_posts ORDER BY id DESC")
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"id": r[0], "author_id": r[1], "author_name": r[2], "title": r[3], "content": r[4]} for r in rows]
 
 @app.post("/api/community")
 def create_community_post(post: CommunityPostCreate):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO community_posts (author_id, author_name, title, content) VALUES (?, ?, ?, ?)",
-        (post.author_id, post.author_name, post.title, post.content)
-    )
+    cursor.execute("INSERT INTO community_posts (author_id, author_name, title, content) VALUES (?, ?, ?, ?)",
+                   (post.author_id, post.author_name, post.title, post.content))
     conn.commit()
     conn.close()
-    return {"message": "Mada yako imechapishwa kwenye Community Forum!"}
+    return {"message": "Mada imetumwa kikamilifu"}
