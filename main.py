@@ -26,51 +26,46 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # Meza ya Watumiaji
+    # Meza ya Watumiaji (Ipo tayari)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            location TEXT NOT NULL
+            phone TEXT,
+            location TEXT
         )
     """)
-    
-    # Meza ya Bidhaa
+
+    # Meza ya Bidhaa (Hakikisha description na image_url zipo)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            seller_id INTEGER NOT NULL,
+            seller_id INTEGER,
             title TEXT NOT NULL,
-            category TEXT NOT NULL,
+            description TEXT,
+            category TEXT,
             price REAL NOT NULL,
-            condition TEXT NOT NULL,
-            location TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            status TEXT DEFAULT 'Available',
-            FOREIGN KEY (seller_id) REFERENCES users (id)
+            condition TEXT,
+            location TEXT,
+            phone TEXT,
+            image_url TEXT
         )
     """)
-    
-    # Meza ya Jukwaa la Jamii (Community Posts)
+
+    # Meza ya Majadiliano (Ipo tayari)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS community_posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            author_id INTEGER NOT NULL,
-            author_name TEXT NOT NULL,
+            author_id INTEGER,
+            author_name TEXT,
             title TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (author_id) REFERENCES users (id)
+            content TEXT NOT NULL
         )
     """)
-    
+
     conn.commit()
     conn.close()
-
-init_db()
-
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
@@ -143,13 +138,14 @@ def login_user(user: UserLogin):
         )
 class ProductCreate(BaseModel):
     title: str
+    description: Optional[str] = None
     category: str
     price: float
+    condition: str
     location: str
     phone: str
     seller_id: Optional[int] = 1
-    condition: Optional[str] = "Mpya"
-    image_url: Optional[str] = "https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=300" # Picha ya mfano
+    image_url: Optional[str] = None
 class CommunityPostCreate(BaseModel):
     author_id: int
     author_name: str
@@ -237,18 +233,54 @@ def get_products(category: Optional[str] = None):
         })
     return products
 
+# --- ADD PRODUCT ---
 @app.post("/api/products")
 def create_product(product: ProductCreate):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO products (seller_id, title, category, price, condition, location, phone, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'Available')",
-        (product.seller_id, product.title, product.category, product.price, product.condition, product.location, product.phone)
-    )
+    cursor.execute("""
+        INSERT INTO products (seller_id, title, description, category, price, condition, location, phone, image_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        product.seller_id,
+        product.title,
+        product.description,
+        product.category,
+        product.price,
+        product.condition,
+        product.location,
+        product.phone,
+        product.image_url
+    ))
     conn.commit()
+    product_id = cursor.lastrowid
     conn.close()
-    return {"message": "Bidhaa imeonyeshwa sokoni kikamilifu!"}
+    return {"message": "Bidhaa imeongezwa kikamilifu", "id": product_id}
 
+# --- GET PRODUCTS ---
+@app.get("/api/products")
+def get_products():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, seller_id, title, description, category, price, condition, location, phone, image_url FROM products ORDER BY id DESC")
+    rows = cursor.fetchall()
+    conn.close()
+    
+    products = []
+    for row in rows:
+        products.append({
+            "id": row[0],
+            "seller_id": row[1],
+            "title": row[2],
+            "description": row[3],
+            "category": row[4],
+            "price": row[5],
+            "condition": row[6],
+            "location": row[7],
+            "phone": row[8],
+            "image_url": row[9]
+        })
+    return products
 # 3. COMMUNITY FORUM ENDPOINTS (Sehemu ya Wafanyabiashara)
 @app.get("/api/community")
 # --- FUTA BIDHAA (DELETE PRODUCT) ---
