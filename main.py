@@ -250,6 +250,25 @@ def create_product(product: ProductCreate):
 
 # 3. COMMUNITY FORUM ENDPOINTS (Sehemu ya Wafanyabiashara)
 @app.get("/api/community")
+# --- FUTA BIDHAA (DELETE PRODUCT) ---
+@app.delete("/api/products/{product_id}")
+def delete_product(product_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
+    conn.commit()
+    conn.close()
+    return {"message": "Bidhaa imefutwa kikamilifu"}
+
+# --- MARK AS SOLD (UPDATE STATUS) ---
+@app.put("/api/products/{product_id}/sold")
+def mark_product_as_sold(product_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE products SET title = '[IMEHAUZWA] ' || title WHERE id = ?", (product_id,))
+    conn.commit()
+    conn.close()
+    return {"message": "Bidhaa imewekwa alama ya kuuzwa"}
 def get_community_posts():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
