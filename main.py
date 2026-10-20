@@ -27,10 +27,19 @@ TOKEN_TTL = int(os.getenv("SOKO_TOKEN_TTL_SECONDS", "86400"))
 ADMIN_RESET_KEY = os.getenv("SOKO_ADMIN_RESET_KEY", "").strip()
 ADMIN_RESET_TTL_SECONDS = 1800  # Dakika 30
 ADMIN_RESET_MAX_ATTEMPTS = 5
-ALLOWED_ORIGINS = [x.strip() for x in os.getenv(
-    "SOKO_ALLOWED_ORIGINS",
-    "http://localhost:8000,http://127.0.0.1:8000,http://localhost:5500,http://127.0.0.1:5500"
-).split(",") if x.strip()]
+
+# Tumeweka rasmi Netlify URL yako hapa kuzuia CORS Error
+ALLOWED_ORIGINS = [
+    "https://resilient-lollipop-9d1120.netlify.app",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500"
+]
+env_origins = os.getenv("SOKO_ALLOWED_ORIGINS", "")
+if env_origins:
+    ALLOWED_ORIGINS.extend([x.strip() for x in env_origins.split(",") if x.strip()])
+
 MAX_IMAGES = 4
 MAX_IMAGE_CHARS = 1_000_000
 
@@ -38,11 +47,6 @@ AT_USERNAME = os.getenv("AT_USERNAME", "").strip()
 AT_API_KEY = os.getenv("AT_API_KEY", "").strip()
 AT_SENDER_ID = os.getenv("AT_SENDER_ID", "").strip()
 AT_ENV = os.getenv("AT_ENV", "live").strip().lower()
-
-OTP_TTL_SECONDS = 600
-OTP_RESEND_SECONDS = 60
-OTP_MAX_PER_HOUR = 3
-OTP_MAX_ATTEMPTS = 5
 
 app = FastAPI(title="Soko la Mtaa API", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
@@ -64,6 +68,7 @@ def db():
         conn.close()
 
 def init_db():
+    """Create tables and safely add columns missing from older databases to prevent 500 errors."""
     with db() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
@@ -94,6 +99,20 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, code_hash TEXT NOT NULL,
             created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
             consumed INTEGER NOT NULL DEFAULT 0, request_ip TEXT)""")
+
+        # Uhakiki wa safu ili kuzuia 500 Error
+        required_columns = {
+            "users": {"username": "TEXT", "password": "TEXT", "phone": "TEXT", "location": "TEXT", "token_version": "INTEGER DEFAULT 0"},
+            "products": {"seller_id": "INTEGER", "title": "TEXT", "description": "TEXT", "category": "TEXT", "item_type": "TEXT DEFAULT 'product'", "price": "REAL", "condition": "TEXT", "location": "TEXT", "region": "TEXT", "district": "TEXT", "ward": "TEXT", "street": "TEXT", "phone": "TEXT", "image_url": "TEXT", "is_sold": "INTEGER DEFAULT 0", "created_at": "TIMESTAMP"},
+            "buyer_requests": {"buyer_id": "INTEGER", "buyer_name": "TEXT", "title": "TEXT", "description": "TEXT", "category": "TEXT", "item_type": "TEXT DEFAULT 'product'", "budget": "REAL", "location": "TEXT", "region": "TEXT", "district": "TEXT", "ward": "TEXT", "street": "TEXT", "phone": "TEXT", "status": "TEXT DEFAULT 'active'", "created_at": "TIMESTAMP"},
+            "orders": {"item_id": "INTEGER", "item_type": "TEXT", "buyer_id": "INTEGER", "seller_id": "INTEGER", "quantity": "INTEGER DEFAULT 1", "status": "TEXT DEFAULT 'pending'", "created_at": "TIMESTAMP"},
+            "community_posts": {"author_id": "INTEGER", "author_name": "TEXT", "title": "TEXT", "content": "TEXT", "created_at": "TIMESTAMP"}
+        }
+        for table, cols in required_columns.items():
+            existing = {row["name"] for row in c.execute(f"PRAGMA table_info({table})")}
+            for col, decl in cols.items():
+                if col not in existing:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 if not (len(sys.argv) > 1 and sys.argv[1] == "reset-database"):
     init_db()
@@ -131,11 +150,14 @@ def current_user(authorization: Optional[str] = Header(default=None)):
         payload = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
         if int(payload["exp"]) < int(time.time()): raise ValueError()
         uid = int(payload["sub"])
+        token_version = int(payload.get("ver", 0))
     except Exception:
         raise HTTPException(401, "Kikao kimeisha au si sahihi. Ingia tena.")
     with db() as c:
         row = c.execute("SELECT id, username, phone, location, token_version FROM users WHERE id=?", (uid,)).fetchone()
     if not row: raise HTTPException(401, "Akaunti haipatikani.")
+    if int(row["token_version"] or 0) != token_version:
+        raise HTTPException(401, "Nenosiri limebadilishwa. Ingia tena.")
     return dict(row)
 
 class StrictModel(BaseModel):
@@ -169,7 +191,7 @@ class ProductCreate(StrictModel):
     ward: Optional[str] = Field(default="", max_length=100)
     street: Optional[str] = Field(default="", max_length=120)
     phone: str = Field(min_length=5, max_length=30)
-    image_url: Optional[str] = Field(default=None)
+    image_url: Optional[str] = Field(default=None, max_length=MAX_IMAGE_CHARS * MAX_IMAGES + 100)
 
 class BuyerRequestCreate(StrictModel):
     title: str = Field(min_length=2, max_length=120)
@@ -218,7 +240,7 @@ def complete_admin_password_reset(payload: AdminPasswordResetComplete):
     with db() as c:
         user = c.execute("SELECT id FROM users WHERE lower(username)=?", (payload.username.strip().lower(),)).fetchone()
         if not user: raise HTTPException(400, "Msimbo si sahihi au akaunti haijapatikana.")
-        c.execute("UPDATE users SET password=? WHERE id=?", (hash_password(payload.new_password), user["id"]))
+        c.execute("UPDATE users SET password=?, token_version=COALESCE(token_version,0)+1 WHERE id=?", (hash_password(payload.new_password), user["id"]))
     return {"message": "Nenosiri limebadilishwa. Sasa ingia kwa nenosiri jipya."}
 
 @app.get("/api/users/me")
