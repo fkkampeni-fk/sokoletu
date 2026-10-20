@@ -14,9 +14,12 @@ import time
 from contextlib import contextmanager
 from typing import Optional, Literal
 
-from fastapi import FastAPI, HTTPException, Depends, Header, status
+from fastapi import FastAPI, HTTPException, Depends, Header, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ConfigDict, field_validator
+from urllib.parse import urlencode
+from urllib.request import Request as URLRequest, urlopen
+from urllib.error import URLError, HTTPError
 
 DB_NAME = os.getenv("SOKO_DB_PATH", "local_market.db")
 TOKEN_SECRET = os.getenv("SOKO_TOKEN_SECRET", "")
@@ -27,6 +30,14 @@ ALLOWED_ORIGINS = [x.strip() for x in os.getenv(
 ).split(",") if x.strip()]
 MAX_IMAGES = 4
 MAX_IMAGE_CHARS = 1_000_000
+AT_USERNAME = os.getenv("AT_USERNAME", "").strip()
+AT_API_KEY = os.getenv("AT_API_KEY", "").strip()
+AT_SENDER_ID = os.getenv("AT_SENDER_ID", "").strip()
+AT_ENV = os.getenv("AT_ENV", "live").strip().lower()
+OTP_TTL_SECONDS = 600
+OTP_RESEND_SECONDS = 60
+OTP_MAX_PER_HOUR = 3
+OTP_MAX_ATTEMPTS = 5
 app = FastAPI(title="Soko la Mtaa API", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
                    allow_credentials=False, allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -55,7 +66,7 @@ def init_db():
     with db() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL, phone TEXT, location TEXT)""")
+            password TEXT NOT NULL, phone TEXT, location TEXT, token_version INTEGER DEFAULT 0)""")
         c.execute("""CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER, title TEXT NOT NULL,
             description TEXT, category TEXT, item_type TEXT DEFAULT 'product', price REAL NOT NULL,
@@ -74,6 +85,19 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS community_posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT, author_id INTEGER, author_name TEXT,
             title TEXT NOT NULL, content TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS password_reset_otps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            phone_norm TEXT NOT NULL,
+            code_hash TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            consumed INTEGER NOT NULL DEFAULT 0,
+            request_ip TEXT
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_password_reset_phone_created ON password_reset_otps(phone_norm, created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_password_reset_user ON password_reset_otps(user_id, consumed)")
 
         # Add columns expected by this version when upgrading an older DB.
         # Declarations intentionally avoid NOT NULL without a default so SQLite
@@ -81,6 +105,7 @@ def init_db():
         required_columns = {
             "users": {
                 "username": "TEXT", "password": "TEXT", "phone": "TEXT", "location": "TEXT",
+                "token_version": "INTEGER DEFAULT 0",
             },
             "products": {
                 "seller_id": "INTEGER", "title": "TEXT", "description": "TEXT",
@@ -147,10 +172,10 @@ def verify_password(password: str, stored: str) -> bool:
     except (ValueError, TypeError):
         return False
 
-def make_token(user_id: int) -> str:
+def make_token(user_id: int, token_version: int = 0) -> str:
     if len(TOKEN_SECRET) < 32:
         raise HTTPException(503, "Seva ya akaunti haijasanidiwa: weka SOKO_TOKEN_SECRET yenye angalau herufi 32.")
-    payload = {"sub": user_id, "exp": int(time.time()) + TOKEN_TTL}
+    payload = {"sub": user_id, "exp": int(time.time()) + TOKEN_TTL, "ver": token_version}
     raw = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
     sig = hmac.new(TOKEN_SECRET.encode(), raw.encode(), hashlib.sha256).digest()
     return raw + "." + base64.urlsafe_b64encode(sig).decode().rstrip("=")
@@ -167,11 +192,14 @@ def current_user(authorization: Optional[str] = Header(default=None)):
         payload = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
         if int(payload["exp"]) < int(time.time()): raise ValueError()
         uid = int(payload["sub"])
+        token_version = int(payload.get("ver", 0))
     except Exception:
         raise HTTPException(401, "Kikao kimeisha au si sahihi. Ingia tena.")
     with db() as c:
-        row = c.execute("SELECT id, username, phone, location FROM users WHERE id=?", (uid,)).fetchone()
+        row = c.execute("SELECT id, username, phone, location, token_version FROM users WHERE id=?", (uid,)).fetchone()
     if not row: raise HTTPException(401, "Akaunti haipatikani.")
+    if int(row["token_version"] or 0) != token_version:
+        raise HTTPException(401, "Nenosiri limebadilishwa. Ingia tena.")
     return dict(row)
 
 class StrictModel(BaseModel):
@@ -186,6 +214,16 @@ class UserRegister(StrictModel):
 class UserLogin(StrictModel):
     username: str = Field(min_length=1, max_length=40)
     password: str = Field(min_length=1, max_length=256)
+
+class PasswordResetRequest(StrictModel):
+    username: str = Field(min_length=1, max_length=40)
+    phone: str = Field(min_length=7, max_length=30)
+
+class PasswordResetVerify(StrictModel):
+    username: str = Field(min_length=1, max_length=40)
+    phone: str = Field(min_length=7, max_length=30)
+    code: str = Field(pattern=r"^\d{6}$")
+    new_password: str = Field(min_length=8, max_length=256)
 
 class ProductCreate(StrictModel):
     title: str = Field(min_length=2, max_length=120)
@@ -261,7 +299,157 @@ def login_user(user: UserLogin):
         if not row["password"].startswith("pbkdf2_sha256$"):
             c.execute("UPDATE users SET password=? WHERE id=?", (hash_password(user.password), row["id"]))
         public_user = {"id": row["id"], "username": row["username"], "phone": row["phone"], "location": row["location"]}
-    return {"message": "Umeingia kikamilifu", "user": public_user, "access_token": make_token(row["id"]), "token_type": "bearer"}
+    return {"message": "Umeingia kikamilifu", "user": public_user, "access_token": make_token(row["id"], int(row["token_version"] or 0)), "token_type": "bearer"}
+
+def normalize_tz_phone(phone: str) -> str:
+    """Normalize Tanzanian phone numbers to 255XXXXXXXXX."""
+    digits = re.sub(r"\D", "", phone or "")
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("0") and len(digits) == 10:
+        digits = "255" + digits[1:]
+    elif len(digits) == 9 and digits[0] in "67":
+        digits = "255" + digits
+    if not re.fullmatch(r"255[67][0-9]{8}", digits):
+        raise HTTPException(400, "Weka namba halali ya Tanzania, mfano 0712345678 au +255712345678.")
+    return digits
+
+def otp_digest(code: str, phone_norm: str) -> str:
+    if len(TOKEN_SECRET) < 32:
+        raise HTTPException(503, "Huduma ya kurejesha nenosiri haijasanidiwa vizuri.")
+    return hmac.new(TOKEN_SECRET.encode(), f"password-reset:{phone_norm}:{code}".encode(), hashlib.sha256).hexdigest()
+
+def send_password_reset_sms(phone_norm: str, code: str) -> None:
+    """Send OTP through Africa's Talking; credentials stay server-side."""
+    if not AT_USERNAME or not AT_API_KEY:
+        raise HTTPException(503, "Huduma ya SMS haijasanidiwa. Weka AT_USERNAME na AT_API_KEY kwenye Render Environment.")
+    if AT_ENV == "sandbox":
+        endpoint = "https://api.sandbox.africastalking.com/version1/messaging"
+    else:
+        endpoint = "https://api.africastalking.com/version1/messaging"
+    message = f"Soko la Mtaa: Msimbo wako wa kubadilisha nenosiri ni {code}. Unaisha baada ya dakika 10. Usimpe mtu yeyote msimbo huu."
+    fields = {"username": AT_USERNAME, "to": "+" + phone_norm, "message": message}
+    if AT_SENDER_ID:
+        fields["from"] = AT_SENDER_ID
+    request = URLRequest(endpoint, data=urlencode(fields).encode(), method="POST", headers={
+        "apiKey": AT_API_KEY,
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+    })
+    try:
+        with urlopen(request, timeout=12) as response:
+            payload = response.read(100_000).decode("utf-8", errors="replace")
+            if response.status < 200 or response.status >= 300:
+                raise RuntimeError(f"SMS provider HTTP {response.status}")
+        result = json.loads(payload)
+        recipients = result.get("SMSMessageData", {}).get("Recipients", [])
+        if not recipients or not any(str(r.get("status", "")).lower() in ("success", "sent", "accepted") or r.get("statusCode") in (100, 101, 102) for r in recipients):
+            raise RuntimeError("SMS provider did not accept the message")
+    except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError) as exc:
+        # Do not log API key, OTP, or full provider response.
+        print(f"SMS provider error: {type(exc).__name__}")
+        raise HTTPException(502, "SMS haikutumwa. Hakikisha akaunti ya SMS, API key na salio viko sawa, kisha jaribu tena.")
+
+@app.post("/api/users/password-reset/request")
+def request_password_reset(payload: PasswordResetRequest, request: Request):
+    """Request an SMS OTP for a matching username + registered phone number."""
+    # Check global configuration before account lookup to avoid account-enumeration side channels.
+    if not AT_USERNAME or not AT_API_KEY:
+        raise HTTPException(503, "Huduma ya SMS haijasanidiwa. Msimamizi aweke AT_USERNAME na AT_API_KEY kwenye Render Environment.")
+    if len(TOKEN_SECRET) < 32:
+        raise HTTPException(503, "SOKO_TOKEN_SECRET haijasanidiwa vizuri kwenye Render.")
+
+    phone_norm = normalize_tz_phone(payload.phone)
+    username_norm = payload.username.strip().lower()
+    now = int(time.time())
+    ip = (request.client.host if request.client else "unknown")[:64]
+    generic = {"message": "Ikiwa jina la mtumiaji na namba vinaendana na akaunti, utapokea SMS yenye msimbo wa uthibitisho."}
+
+    with db() as c:
+        # Limit requests by phone and IP to reduce abuse and unexpected SMS charges.
+        recent_phone = c.execute(
+            "SELECT COUNT(*) n, MAX(created_at) last FROM password_reset_otps WHERE phone_norm=? AND created_at>?",
+            (phone_norm, now - 3600),
+        ).fetchone()
+        recent_ip = c.execute(
+            "SELECT COUNT(*) n FROM password_reset_otps WHERE request_ip=? AND created_at>?",
+            (ip, now - 3600),
+        ).fetchone()
+        if recent_phone["last"] and now - recent_phone["last"] < OTP_RESEND_SECONDS:
+            raise HTTPException(429, "Subiri dakika moja kabla ya kuomba msimbo mwingine.")
+        if recent_phone["n"] >= OTP_MAX_PER_HOUR or recent_ip["n"] >= 10:
+            raise HTTPException(429, "Umeomba misimbo mara nyingi. Jaribu tena baada ya muda.")
+
+        candidates = c.execute(
+            "SELECT id, username, phone FROM users WHERE lower(username)=?",
+            (username_norm,),
+        ).fetchall()
+        matched = next((row for row in candidates if normalize_phone_safe(row["phone"] or "") == phone_norm), None)
+
+        if not matched:
+            # Record a consumed dummy row so unknown usernames/numbers are also rate-limited.
+            c.execute("INSERT INTO password_reset_otps(user_id,phone_norm,code_hash,created_at,expires_at,attempts,consumed,request_ip) VALUES(?,?,?,?,?,0,1,?)",
+                      (0, phone_norm, secrets.token_hex(32), now, now + OTP_TTL_SECONDS, ip))
+            return generic
+
+        user_id = int(matched["id"])
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        digest = otp_digest(code, phone_norm)
+        c.execute("UPDATE password_reset_otps SET consumed=1 WHERE user_id=? AND consumed=0", (user_id,))
+        c.execute("INSERT INTO password_reset_otps(user_id,phone_norm,code_hash,created_at,expires_at,request_ip) VALUES(?,?,?,?,?,?)",
+                  (user_id, phone_norm, digest, now, now + OTP_TTL_SECONDS, ip))
+
+    try:
+        send_password_reset_sms(phone_norm, code)
+    except HTTPException as exc:
+        with db() as c:
+            c.execute("UPDATE password_reset_otps SET consumed=1 WHERE user_id=? AND consumed=0", (user_id,))
+        # Same outward response as a non-matching account; provider details stay in server logs.
+        print(f"Password reset SMS delivery failed: HTTP {exc.status_code}")
+        return generic
+    return generic
+
+def normalize_phone_safe(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone or "")
+    if digits.startswith("00"): digits = digits[2:]
+    if digits.startswith("0") and len(digits) == 10: digits = "255" + digits[1:]
+    elif len(digits) == 9 and digits[:1] in "67": digits = "255" + digits
+    return digits
+
+@app.post("/api/users/password-reset/verify")
+def verify_password_reset(payload: PasswordResetVerify):
+    phone_norm = normalize_tz_phone(payload.phone)
+    username_norm = payload.username.strip().lower()
+    now = int(time.time())
+    bad_code = False
+    error_message = None
+    with db() as c:
+        user = c.execute("SELECT id FROM users WHERE lower(username)=?", (username_norm,)).fetchone()
+        if not user or normalize_phone_safe(c.execute("SELECT phone FROM users WHERE id=?", (user["id"],)).fetchone()["phone"] or "") != phone_norm:
+            error_message = "Msimbo si sahihi au muda wake umeisha. Omba OTP mpya."
+        else:
+            row = c.execute("""SELECT * FROM password_reset_otps WHERE user_id=? AND phone_norm=? AND consumed=0
+                ORDER BY id DESC LIMIT 1""", (user["id"], phone_norm)).fetchone()
+            if not row or row["expires_at"] < now or row["attempts"] >= OTP_MAX_ATTEMPTS:
+                if row and row["attempts"] >= OTP_MAX_ATTEMPTS:
+                    c.execute("UPDATE password_reset_otps SET consumed=1 WHERE id=?", (row["id"],))
+                error_message = "Msimbo umeisha muda wake au si sahihi. Omba msimbo mpya."
+            else:
+                digest = otp_digest(payload.code, phone_norm)
+                if not hmac.compare_digest(digest, row["code_hash"]):
+                    attempts = int(row["attempts"]) + 1
+                    c.execute("UPDATE password_reset_otps SET attempts=?, consumed=? WHERE id=?",
+                              (attempts, 1 if attempts >= OTP_MAX_ATTEMPTS else 0, row["id"]))
+                    bad_code = True
+                else:
+                    c.execute("UPDATE users SET password=?, token_version=COALESCE(token_version,0)+1 WHERE id=?",
+                              (hash_password(payload.new_password), user["id"]))
+                    c.execute("UPDATE password_reset_otps SET consumed=1 WHERE user_id=? AND consumed=0", (user["id"],))
+    if error_message:
+        raise HTTPException(400, error_message)
+    if bad_code:
+        raise HTTPException(400, "Msimbo si sahihi. Una hadi majaribio 5; angalia OTP ya SMS.")
+    return {"message": "Nenosiri limebadilishwa. Kikao cha zamani kimefungwa; ingia kwa nenosiri jipya."}
 
 @app.get("/api/users/me")
 def me(user=Depends(current_user)): return {"user": user}
