@@ -30,18 +30,17 @@ ADMIN_RESET_MAX_ATTEMPTS = 5
 
 # Tumeweka rasmi Netlify URL yako hapa kuzuia CORS Error
 ALLOWED_ORIGINS = [
-ALLOWED_ORIGINS = [
     "https://gilded-melba-8dbb88.netlify.app",
     "https://resilient-lollipop-9d1120.netlify.app",
     "http://localhost:8000",
     "http://127.0.0.1:8000",
     "http://localhost:5500",
-    "http://127.0.0.1:5500"
-]
+    "http://127.0.0.1:5500",
 ]
 env_origins = os.getenv("SOKO_ALLOWED_ORIGINS", "")
 if env_origins:
-    ALLOWED_ORIGINS.extend([x.strip() for x in env_origins.split(",") if x.strip()])
+    ALLOWED_ORIGINS.extend([x.strip().rstrip("/") for x in env_origins.split(",") if x.strip()])
+ALLOWED_ORIGINS = list(dict.fromkeys(origin.rstrip("/") for origin in ALLOWED_ORIGINS if origin.strip()))
 
 MAX_IMAGES = 4
 MAX_IMAGE_CHARS = 1_000_000
