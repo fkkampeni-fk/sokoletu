@@ -1,5 +1,9 @@
 import base64
 import hashlib
+import argparse
+import shutil
+from datetime import datetime
+import sys
 import hmac
 import json
 import os
@@ -116,7 +120,10 @@ def init_db():
         if "status" in request_columns:
             c.execute("CREATE INDEX IF NOT EXISTS idx_buyer_requests_status ON buyer_requests(status)")
 
-init_db()
+# Skip automatic initialization when running the destructive reset CLI command.
+# Normal Uvicorn imports still initialize/migrate the database as before.
+if not (len(sys.argv) > 1 and sys.argv[1] == "reset-database"):
+    init_db()
 
 def clean_text(value: Optional[str], max_len: int = 500) -> Optional[str]:
     if value is None: return None
@@ -351,3 +358,55 @@ def create_community_post(post: CommunityPostCreate, user=Depends(current_user))
         cur = c.execute("INSERT INTO community_posts(author_id,author_name,title,content) VALUES(?,?,?,?)",
                         (user["id"], user["username"], post.title.strip(), post.content.strip()))
         return {"message": "Mada imetumwa kikamilifu", "id": cur.lastrowid}
+
+
+def reset_database():
+    """Delete marketplace data after creating a timestamped backup."""
+    path = DB_NAME
+    if not os.path.isfile(path):
+        raise SystemExit(
+            f"Database haipo: {path}. Hakuna kilichofutwa. "
+            "Hakikisha SOKO_DB_PATH inaelekeza kwenye database sahihi."
+        )
+
+    backup = path + ".backup-before-reset-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    shutil.copy2(path, backup)
+    conn = sqlite3.connect(path, timeout=15)
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        for table in ("orders", "community_posts", "buyer_requests", "products", "users"):
+            if table in tables:
+                conn.execute(f'DELETE FROM "{table}"')
+                print(f"Data imefutwa: {table}")
+        if "sqlite_sequence" in tables:
+            conn.execute("DELETE FROM sqlite_sequence")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    print("Ufutaji umekamilika. Backup imehifadhiwa kwenye:", backup)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Soko la Mtaa backend maintenance")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    reset_parser = subparsers.add_parser(
+        "reset-database", help="Futa data za soko baada ya kutengeneza backup"
+    )
+    reset_parser.add_argument(
+        "--confirm-delete-all", action="store_true",
+        help="Thibitisha kufuta akaunti, bidhaa, oda, maombi na machapisho"
+    )
+    args = parser.parse_args()
+    if args.command == "reset-database":
+        if not args.confirm_delete_all:
+            raise SystemExit(
+                "HAKUNA KILICHOFUTWA. Rudia amri na --confirm-delete-all "
+                "ikiwa una uhakika unataka kufuta data zote."
+            )
+        reset_database()
