@@ -30,11 +30,14 @@ ADMIN_RESET_MAX_ATTEMPTS = 5
 
 # Tumeweka rasmi Netlify URL yako hapa kuzuia CORS Error
 ALLOWED_ORIGINS = [
+ALLOWED_ORIGINS = [
+    "https://gilded-melba-8dbb88.netlify.app",
     "https://resilient-lollipop-9d1120.netlify.app",
     "http://localhost:8000",
     "http://127.0.0.1:8000",
     "http://localhost:5500",
     "http://127.0.0.1:5500"
+]
 ]
 env_origins = os.getenv("SOKO_ALLOWED_ORIGINS", "")
 if env_origins:
