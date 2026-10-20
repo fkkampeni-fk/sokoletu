@@ -24,6 +24,9 @@ from urllib.error import URLError, HTTPError
 DB_NAME = os.getenv("SOKO_DB_PATH", "local_market.db")
 TOKEN_SECRET = os.getenv("SOKO_TOKEN_SECRET", "")
 TOKEN_TTL = int(os.getenv("SOKO_TOKEN_TTL_SECONDS", "86400"))
+ADMIN_RESET_KEY = os.getenv("SOKO_ADMIN_RESET_KEY", "").strip()
+ADMIN_RESET_TTL_SECONDS = 1800  # 30 minutes
+ADMIN_RESET_MAX_ATTEMPTS = 5
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv(
     "SOKO_ALLOWED_ORIGINS",
     "http://localhost:8000,http://127.0.0.1:8000,http://localhost:5500,http://127.0.0.1:5500"
@@ -98,6 +101,18 @@ def init_db():
         )""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_password_reset_phone_created ON password_reset_otps(phone_norm, created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_password_reset_user ON password_reset_otps(user_id, consumed)")
+        c.execute("""CREATE TABLE IF NOT EXISTS admin_password_resets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            code_hash TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            consumed INTEGER NOT NULL DEFAULT 0,
+            request_ip TEXT
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_admin_reset_user ON admin_password_resets(user_id, consumed)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_admin_reset_ip_created ON admin_password_resets(request_ip, created_at)")
 
         # Add columns expected by this version when upgrading an older DB.
         # Declarations intentionally avoid NOT NULL without a default so SQLite
@@ -223,6 +238,14 @@ class PasswordResetVerify(StrictModel):
     username: str = Field(min_length=1, max_length=40)
     phone: str = Field(min_length=7, max_length=30)
     code: str = Field(pattern=r"^\d{6}$")
+    new_password: str = Field(min_length=8, max_length=256)
+
+class AdminPasswordResetCreate(StrictModel):
+    username: str = Field(min_length=1, max_length=40)
+
+class AdminPasswordResetComplete(StrictModel):
+    username: str = Field(min_length=1, max_length=40)
+    reset_code: str = Field(pattern=r"^\d{8}$")
     new_password: str = Field(min_length=8, max_length=256)
 
 class ProductCreate(StrictModel):
@@ -449,6 +472,93 @@ def verify_password_reset(payload: PasswordResetVerify):
         raise HTTPException(400, error_message)
     if bad_code:
         raise HTTPException(400, "Msimbo si sahihi. Una hadi majaribio 5; angalia OTP ya SMS.")
+    return {"message": "Nenosiri limebadilishwa. Kikao cha zamani kimefungwa; ingia kwa nenosiri jipya."}
+
+def admin_reset_digest(user_id: int, code: str) -> str:
+    if len(TOKEN_SECRET) < 32:
+        raise HTTPException(503, "Huduma ya kurejesha nenosiri haijasanidiwa vizuri.")
+    return hmac.new(TOKEN_SECRET.encode(), f"admin-password-reset:{user_id}:{code}".encode(), hashlib.sha256).hexdigest()
+
+@app.post("/api/admin/password-reset/create")
+def create_admin_password_reset(
+    payload: AdminPasswordResetCreate,
+    request: Request,
+    x_admin_reset_key: Optional[str] = Header(default=None, alias="X-Admin-Reset-Key"),
+):
+    """Admin-only: create a short-lived code to give privately to the account owner."""
+    if len(ADMIN_RESET_KEY) < 32:
+        raise HTTPException(503, "Msimamizi hajaweka SOKO_ADMIN_RESET_KEY yenye angalau herufi 32 kwenye Render Environment.")
+    if not x_admin_reset_key or not hmac.compare_digest(x_admin_reset_key, ADMIN_RESET_KEY):
+        # Do not reveal whether the configured key exists or is close to correct.
+        raise HTTPException(401, "Huruhusiwi kutumia huduma hii.")
+    if len(TOKEN_SECRET) < 32:
+        raise HTTPException(503, "SOKO_TOKEN_SECRET haijasanidiwa vizuri kwenye Render.")
+
+    now = int(time.time())
+    ip = (request.client.host if request.client else "unknown")[:64]
+    username = payload.username.strip().lower()
+    with db() as c:
+        recent_ip = c.execute(
+            "SELECT COUNT(*) n FROM admin_password_resets WHERE request_ip=? AND created_at>?",
+            (ip, now - 3600),
+        ).fetchone()["n"]
+        if recent_ip >= 10:
+            raise HTTPException(429, "Majaribio mengi ya kurejesha akaunti kutoka kwenye muunganisho huu. Jaribu baadaye.")
+        user = c.execute("SELECT id, username FROM users WHERE lower(username)=?", (username,)).fetchone()
+        if not user:
+            raise HTTPException(404, "Akaunti hiyo haijapatikana. Hakikisha jina la mtumiaji limeandikwa sawa.")
+        recent_user = c.execute(
+            "SELECT COUNT(*) n FROM admin_password_resets WHERE user_id=? AND created_at>?",
+            (user["id"], now - 3600),
+        ).fetchone()["n"]
+        if recent_user >= 3:
+            raise HTTPException(429, "Akaunti hii imeombewa misimbo mara nyingi. Jaribu tena baadaye.")
+        code = f"{secrets.randbelow(100_000_000):08d}"
+        digest = admin_reset_digest(int(user["id"]), code)
+        c.execute("UPDATE admin_password_resets SET consumed=1 WHERE user_id=? AND consumed=0", (user["id"],))
+        c.execute(
+            "INSERT INTO admin_password_resets(user_id,code_hash,created_at,expires_at,request_ip) VALUES(?,?,?,?,?)",
+            (user["id"], digest, now, now + ADMIN_RESET_TTL_SECONDS, ip),
+        )
+    # This response is available only after successful admin-key authentication.
+    return {"message": "Msimbo umetengenezwa. Mtumie mmiliki wa akaunti kupitia njia ya faragha.",
+            "username": user["username"], "reset_code": code, "expires_in_minutes": 30,
+            "warning": "Usiweke msimbo huu kwenye tovuti ya umma au ujumbe wa kundi. Ni wa matumizi mara moja tu."}
+
+@app.post("/api/users/password-reset/admin-verify")
+def complete_admin_password_reset(payload: AdminPasswordResetComplete, request: Request):
+    """Public owner flow: complete reset using a one-time code issued by an authenticated admin."""
+    now = int(time.time())
+    ip = (request.client.host if request.client else "unknown")[:64]
+    username = payload.username.strip().lower()
+    error = "Msimbo wa msimamizi si sahihi, umeisha muda wake, au hauendani na akaunti. Wasiliana na msimamizi upate msimbo mpya."
+    with db() as c:
+        # Limit repeated attempts from an IP before touching account data.
+        recent_ip = c.execute(
+            "SELECT COUNT(*) n FROM admin_password_resets WHERE request_ip=? AND created_at>?",
+            (ip, now - 3600),
+        ).fetchone()["n"]
+        if recent_ip >= 30:
+            raise HTTPException(429, "Majaribio mengi sana. Jaribu baadaye.")
+        user = c.execute("SELECT id FROM users WHERE lower(username)=?", (username,)).fetchone()
+        if not user:
+            raise HTTPException(400, error)
+        row = c.execute("""SELECT * FROM admin_password_resets
+            WHERE user_id=? AND consumed=0 ORDER BY id DESC LIMIT 1""", (user["id"],)).fetchone()
+        if not row or int(row["expires_at"]) < now or int(row["attempts"]) >= ADMIN_RESET_MAX_ATTEMPTS:
+            if row and int(row["attempts"]) >= ADMIN_RESET_MAX_ATTEMPTS:
+                c.execute("UPDATE admin_password_resets SET consumed=1 WHERE id=?", (row["id"],))
+            raise HTTPException(400, error)
+        digest = admin_reset_digest(int(user["id"]), payload.reset_code)
+        if not hmac.compare_digest(digest, row["code_hash"]):
+            attempts = int(row["attempts"]) + 1
+            c.execute("UPDATE admin_password_resets SET attempts=?, consumed=? WHERE id=?",
+                      (attempts, 1 if attempts >= ADMIN_RESET_MAX_ATTEMPTS else 0, row["id"]))
+            raise HTTPException(400, error)
+        c.execute("UPDATE users SET password=?, token_version=COALESCE(token_version,0)+1 WHERE id=?",
+                  (hash_password(payload.new_password), user["id"]))
+        c.execute("UPDATE admin_password_resets SET consumed=1 WHERE user_id=? AND consumed=0", (user["id"],))
+        c.execute("UPDATE password_reset_otps SET consumed=1 WHERE user_id=? AND consumed=0", (user["id"],))
     return {"message": "Nenosiri limebadilishwa. Kikao cha zamani kimefungwa; ingia kwa nenosiri jipya."}
 
 @app.get("/api/users/me")
